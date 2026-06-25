@@ -12,7 +12,7 @@ from datetime import datetime
 
 import fitz
 import pdfplumber
-from PIL import Image
+from PIL import Image, ImageDraw
 from playwright.async_api import async_playwright
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -893,12 +893,24 @@ def find_fund_fee_page(pdf_path: Path) -> int | None:
     return None
 
 
-def capture_fund_fee_table(pdf_path: Path, pg_num: int, out_img: Path, zoom: float = 2.5) -> Path:
-    """펀드 투자설명서의 '집합투자기구에 부과되는 보수 및 비용' 표를 여러 페이지에 걸쳐 캡처"""
+def extract_fund_class(fund_name: str) -> str | None:
+    """펀드명 마지막 토큰에서 클래스 이름 추출 (예: 'C-Pe', 'C1', 'Ci')"""
+    if not fund_name:
+        return None
+    for token in reversed(fund_name.split()):
+        if re.match(r'^[A-Za-z][a-zA-Z0-9\-]{0,6}$', token):
+            return token
+    return None
+
+
+def capture_fund_fee_table(pdf_path: Path, pg_num: int, out_img: Path,
+                           zoom: float = 2.5, class_name: str | None = None) -> Path:
+    """펀드 투자설명서의 '집합투자기구에 부과되는 보수 및 비용' 첫 번째 표만 캡처.
+    class_name 지정 시 해당 클래스 행에 빨간 테두리 표시.
+    """
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
 
-    # 시작 키워드로 페이지 내 y 좌표 탐색 (나./다./마. 등 다양한 접두사)
     start_kws = [
         "나. 집합투자기구에 부과되는 보수 및 비용",
         "다. 집합투자기구에 부과되는 보수 및 비용",
@@ -908,75 +920,167 @@ def capture_fund_fee_table(pdf_path: Path, pg_num: int, out_img: Path, zoom: flo
         "집합투자기구에 부과되는 보수 및 비용",
         "집합투자기구에부과되는보수및비용",
     ]
-    # 표가 끝나는 시점 키워드 — 다음 섹션이 시작되면 종료
     end_kws = [
         "(2) 투자신탁 관련 비용",
         "(2)투자신탁 관련 비용",
         "(2) 이 투자신탁",
-        "투자기간 1년",           # 투자기간별 총비용 예시표 시작
+        "투자기간 1년",
         "클래스종류 투자기간",
-        "다. 보수 및 지급내역",    # 삼성/일반 펀드
+        "다. 보수 및 지급내역",
         "다.보수 및 지급내역",
-        "라. 보수 및 지급내역",    # 신한 펀드
+        "라. 보수 및 지급내역",
         "라.보수 및 지급내역",
         "14. 이익 배분",
     ]
 
-    start_y_pdf = None
+    # 시작 페이지에서 heading y 좌표 탐색
     page0 = doc[pg_num]
+    start_y_pdf = None
     for kw in start_kws:
         hits = page0.search_for(kw)
         if hits:
             start_y_pdf = hits[0].y0 - 10
             break
 
-    # 최대 3페이지 (실제론 1~2페이지)
+    # 최대 2페이지 탐색 (표는 1~2페이지)
+    # end_y_pdf: 끝 키워드의 y좌표 (페이지 인덱스 포함)
     pages_needed = [pg_num]
-    for next_pn in range(pg_num + 1, min(pg_num + 3, total_pages)):
-        next_text = doc[next_pn].get_text()
-        if any(kw in next_text for kw in end_kws):
-            # 끝 키워드가 페이지 전반부(위쪽 40%)에 있으면 해당 페이지 제외, 후반부면 포함
-            lines = next_text.split("\n")
-            end_line_idx = None
-            for idx, line in enumerate(lines):
-                if any(kw in line for kw in end_kws):
-                    end_line_idx = idx
-                    break
-            if end_line_idx is not None and end_line_idx > len(lines) * 0.4:
-                pages_needed.append(next_pn)
+    end_page_idx = 0   # pages_needed 내 인덱스
+    end_y_pdf = None   # 끝 키워드 y (PDF 좌표)
+
+    # 시작 페이지 자체에 끝 키워드가 있는지 확인 (heading 아래에 있을 때만)
+    for kw in end_kws:
+        hits = page0.search_for(kw)
+        for h in hits:
+            if start_y_pdf is None or h.y0 > start_y_pdf + 20:
+                end_y_pdf = h.y0 - 5
+                break
+        if end_y_pdf is not None:
             break
-        pages_needed.append(next_pn)
+
+    # 끝 키워드를 아직 못 찾았으면 다음 페이지 확인 (1장만)
+    if end_y_pdf is None and pg_num + 1 < total_pages:
+        next_pn = pg_num + 1
+        next_page = doc[next_pn]
+        found_end = False
+        for kw in end_kws:
+            hits = next_page.search_for(kw)
+            if hits:
+                kw_y = hits[0].y0
+                page_h = next_page.rect.height
+                if kw_y > page_h * 0.4:
+                    # 후반부에 끝 키워드 → 이 페이지 포함, 거기서 자름
+                    pages_needed.append(next_pn)
+                    end_page_idx = 1
+                    end_y_pdf = kw_y - 5
+                else:
+                    # 전반부 → 이 페이지 제외
+                    pass
+                found_end = True
+                break
+        if not found_end:
+            pages_needed.append(next_pn)
+            end_page_idx = 1
 
     print(f"  → 캡처 대상 페이지: {[p+1 for p in pages_needed]}")
 
-    # 각 페이지 이미지 렌더링
+    # 각 페이지 렌더링 (doc은 나중에 red box 그릴 때까지 열어둠)
     page_images = []
     for pn in pages_needed:
         pix = doc[pn].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
         page_images.append(Image.open(BytesIO(pix.tobytes("png"))))
-    doc.close()
 
     # 수직 연결
-    total_h = sum(img.height for img in page_images)
-    full_img = Image.new("RGB", (page_images[0].width, total_h), "white")
-    y_off = 0
+    cumulative_h = [0]
     for img in page_images:
-        full_img.paste(img, (0, y_off))
-        y_off += img.height
+        cumulative_h.append(cumulative_h[-1] + img.height)
+    total_h = cumulative_h[-1]
+
+    full_img = Image.new("RGB", (page_images[0].width, total_h), "white")
+    for i, img in enumerate(page_images):
+        full_img.paste(img, (0, cumulative_h[i]))
 
     img_w = page_images[0].width
-    single_h = page_images[0].height
 
-    # 시작 y 위치(픽셀) 계산
-    try:
+    # 위쪽 crop 좌표 (PDF y → pixel)
+    cy0 = max(0, int((start_y_pdf or 0) * zoom) - 10)
+
+    # 아래쪽 crop 좌표
+    if end_y_pdf is not None:
+        cy1 = cumulative_h[end_page_idx] + int(end_y_pdf * zoom)
+    else:
+        cy1 = total_h
+    cy1 = min(cy1, total_h)
+
+    doc.close()
+
+    cropped = full_img.crop((0, cy0, img_w, cy1))
+
+    # 클래스 행에 빨간 테두리 표시
+    # PDF 구조: 첫 번째 열에 "수수료종류설명\n(C-pe)" 형태로 클래스코드가 괄호 안에 있음
+    # pdfplumber로 왼쪽 열 텍스트를 줄별로 묶어, 괄호 포함 클래스명 검색
+    if class_name:
+        cls_norm = class_name.lower().replace('-', '').replace(' ', '')
+        draw = ImageDraw.Draw(cropped)
+        crop_h = cropped.height
+
         with pdfplumber.open(pdf_path) as pdf:
-            pl0 = pdf.pages[pg_num]
-            sy = single_h / pl0.height
-            cy0 = max(0, int((start_y_pdf or 0) * sy) - 10)
-    except Exception:
-        cy0 = 0
+            for i, pn in enumerate(pages_needed):
+                pl_page = pdf.pages[pn]
+                page_w = pl_page.width
 
-    cropped = full_img.crop((0, cy0, img_w, total_h))
+                # 왼쪽 열(40% 이내) 단어를 y좌표 5pt 버킷으로 묶기
+                rows_by_y: dict[int, list] = {}
+                for w in (pl_page.extract_words() or []):
+                    if w['x0'] >= page_w * 0.4:
+                        continue
+                    bucket = round(w['top'] / 5) * 5
+                    rows_by_y.setdefault(bucket, []).append(w)
+
+                # 인접한 버킷들을 묶어 "논리 행" 구성 (15pt 이내 연속이면 같은 행)
+                sorted_buckets = sorted(rows_by_y)
+                logical_rows: list[list] = []
+                for b in sorted_buckets:
+                    if logical_rows and b - sorted_buckets[sorted_buckets.index(b) - 1] <= 15:
+                        logical_rows[-1].extend(rows_by_y[b])
+                    else:
+                        logical_rows.append(list(rows_by_y[b]))
+
+                for lr_words in logical_rows:
+                    # 이 논리 행의 전체 텍스트에서 괄호 안 클래스코드 찾기
+                    full_text = ''.join(w['text'] for w in lr_words)
+                    # 괄호 안 문자 추출: (C-pe) → cpe
+                    import re as _re
+                    parens_matches = _re.findall(r'\(([^)]+)\)', full_text)
+                    found = False
+                    for m in parens_matches:
+                        m_norm = m.lower().replace('-', '').replace(' ', '')
+                        if m_norm == cls_norm:
+                            found = True
+                            break
+                    # 괄호 없이 전체가 클래스명인 경우도 허용
+                    if not found:
+                        full_norm = full_text.lower().replace('-','').replace(' ','').replace('(','').replace(')','')
+                        if full_norm == cls_norm:
+                            found = True
+
+                    if not found:
+                        continue
+
+                    # 행 전체 y범위 (위로 2줄분 ~25pt 확장하여 설명텍스트+숫자행 포함)
+                    row_top = min(w['top'] for w in lr_words) - 25
+                    row_bot = max(w['bottom'] for w in lr_words) + 5
+
+                    y0_px = cumulative_h[i] + int(row_top * zoom) - cy0
+                    y1_px = cumulative_h[i] + int(row_bot  * zoom) - cy0
+                    if y1_px < 0 or y0_px > crop_h:
+                        continue
+                    y0_px = max(0, y0_px)
+                    y1_px = min(crop_h - 1, y1_px)
+                    draw.rectangle([2, y0_px, img_w - 3, y1_px], outline="red", width=3)
+                    print(f"  → 클래스 행 표시: '{class_name}' y={y0_px}~{y1_px}px")
+
+        del draw
     cropped.save(str(out_img), "PNG")
     print(f"  ✅ 펀드 보수표 저장: {out_img.name}")
     return out_img
@@ -1553,7 +1657,10 @@ async def main():
                                          "breakdown": {}, "img": None})
                     continue
 
-                capture_fund_fee_table(pdf_path, pg_num, img_path)
+                fund_class = extract_fund_class(name)
+                print(f"  → 펀드명: {repr(name)}")
+                print(f"  → 클래스추출: {repr(fund_class)}")
+                capture_fund_fee_table(pdf_path, pg_num, img_path, class_name=fund_class)
 
                 fund_results.append({
                     **item,

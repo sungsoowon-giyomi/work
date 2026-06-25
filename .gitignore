@@ -1,22 +1,3 @@
-# 출력 파일 (용량 큰 파일)
-output/pdfs/
-output/images/
-output/*.pptx
-output/*.json
-
-# Python 캐시
+output/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-
-# 환경 설정
-.env
-venv/
-.venv/
-
-# 에디터
-.vscode/
-.idea/
