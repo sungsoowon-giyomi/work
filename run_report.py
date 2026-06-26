@@ -81,16 +81,23 @@ def load_config(path: str = "config.txt"):
                 us_items.append({"ticker": ticker, "name": name, "_preset_id": etfcheck_id})
 
             elif section == "fund":
+                # 형식: FUND_ID [CLASS] [펀드명]
+                # 예: K55105BA7311
+                #     K55105BA7311 A
+                #     K55105BA7311 C-Pe 삼성미국S&P500펀드
                 tokens = line.split()
                 fund_id = None
-                # 마지막 토큰이 KR... 또는 K+영숫자 코드면 fund_id로 인식
-                # 예: "KR5105926715" 단독, 또는 "펀드명 KR5105926715"
-                if tokens and re.match(r'^K[0-9A-Z]{10,}$', tokens[-1], re.IGNORECASE):
-                    fund_id = tokens[-1].upper()
-                    fname = line[:line.rfind(tokens[-1])].strip() or fund_id
-                else:
-                    fname = line
-                fund_items.append({"name": fname, "sotCd": None, "_fund_id": fund_id})
+                fund_class = None
+                name_parts = []
+                for tok in tokens:
+                    if re.match(r'^K[0-9A-Z]{10,}$', tok, re.IGNORECASE):
+                        fund_id = tok.upper()
+                    elif fund_id and re.match(r'^[A-Za-z][A-Za-z0-9\-]{0,6}$', tok) and fund_class is None:
+                        fund_class = tok          # 펀드코드 뒤 짧은 영문 토큰 = 클래스명
+                    else:
+                        name_parts.append(tok)
+                fname = ' '.join(name_parts) or fund_id or line
+                fund_items.append({"name": fname, "sotCd": None, "_fund_id": fund_id, "_class": fund_class})
 
     print(f"\n[config] 한국 ETF {len(kr_items)}개, 미국 ETF {len(us_items)}개, 펀드 {len(fund_items)}개 로드")
     return kr_items, us_items, fund_items
@@ -894,12 +901,39 @@ def find_fund_fee_page(pdf_path: Path) -> int | None:
 
 
 def extract_fund_class(fund_name: str) -> str | None:
-    """펀드명 마지막 토큰에서 클래스 이름 추출 (예: 'C-Pe', 'C1', 'Ci')"""
+    """펀드명에서 클래스명 추출.
+    종류C-Pe / ClassC-P2e / _Ce / (Ce) / (종류C-e) / ]C-Pe / Cpe(퇴직연금) 등 처리.
+    """
     if not fund_name:
         return None
-    for token in reversed(fund_name.split()):
-        if re.match(r'^[A-Za-z][a-zA-Z0-9\-]{0,6}$', token):
-            return token
+    # 1. '종류XXX' 패턴
+    m = re.search(r'종류([A-Za-z][A-Za-z0-9\-]{0,8})', fund_name)
+    if m: return m.group(1)
+    # 2. 'ClassXXX' 패턴
+    m = re.search(r'Class([A-Za-z][A-Za-z0-9\-]{0,8})', fund_name)
+    if m: return m.group(1)
+    # 3. 괄호 안 '종류XXX'
+    m = re.search(r'\(종류([A-Za-z][A-Za-z0-9\-]{0,8})\)', fund_name)
+    if m: return m.group(1)
+    # 4. XXX(퇴직연금) 또는 XXX(연금저축)
+    m = re.search(r'([A-Za-z][A-Za-z0-9\-]{1,8})\((?:퇴직연금|연금저축)\)', fund_name)
+    if m: return m.group(1)
+    # 5. _XXX 패턴
+    m = re.search(r'_([A-Za-z][A-Za-z0-9\-]{0,8})(?=[\[\(\t]|$)', fund_name)
+    if m: return m.group(1)
+    # 6. ]/[ 바로 뒤 영문 클래스 (끝 또는 연금 표시 전)
+    m = re.search(r'[\]\[]([A-Za-z][A-Za-z0-9\-]{1,8})(?:\(퇴직연금\)|\(연금저축\)|$)', fund_name)
+    if m: return m.group(1)
+    m = re.search(r'[\]\[]([A-Za-z][A-Za-z0-9\-]{1,8})$', fund_name)
+    if m: return m.group(1)
+    # 7. 마지막 괄호 안 클래스 (H, UH 등 순수 대문자 약어 제외)
+    matches = re.findall(r'\(([A-Za-z][A-Za-z0-9\-]{1,8})\)', fund_name)
+    for ms in reversed(matches):
+        if not re.match(r'^[A-Z]{1,3}$', ms):
+            return ms
+    # 8. 문자열 끝 영문 클래스
+    m = re.search(r'([A-Za-z][A-Za-z0-9\-]{1,8})$', fund_name)
+    if m: return m.group(1)
     return None
 
 
@@ -1623,6 +1657,10 @@ async def main():
                 pdf_path = PDF_DIR / f"fund_{safe}.pdf"
                 img_path = IMG_DIR / f"fund_{safe}_fee.png"
 
+                # 클래스명: config의 _class 또는 config 펀드명 끝 토큰에서 추출
+                # (funetf 펀드명으로 덮어쓰기 전에 먼저 추출)
+                fund_class = item.get("_class") or extract_fund_class(item["name"])
+
                 print(f"\n[펀드] {name}")
 
                 if not fund_id:
@@ -1657,9 +1695,20 @@ async def main():
                                          "breakdown": {}, "img": None})
                     continue
 
-                fund_class = extract_fund_class(name)
-                print(f"  → 펀드명: {repr(name)}")
-                print(f"  → 클래스추출: {repr(fund_class)}")
+                # PDF 보수 페이지에서 실제 클래스 목록 출력 (참고용)
+                with pdfplumber.open(pdf_path) as _pdf:
+                    all_codes = []
+                    for _pn in [pg_num, pg_num + 1]:
+                        if _pn < len(_pdf.pages):
+                            _text = _pdf.pages[_pn].extract_text() or ""
+                            all_codes += re.findall(r'\(([A-Za-z][A-Za-z0-9\-]{0,6})\)', _text)
+                    all_codes = list(dict.fromkeys(all_codes))
+                    print(f"  → PDF 클래스 목록: {all_codes}")
+
+                if fund_class:
+                    print(f"  → 강조 클래스: {fund_class}")
+                else:
+                    print(f"  ⚠️  클래스 미지정 — config에 'FUND_ID 클래스명' 형태로 입력하세요")
                 capture_fund_fee_table(pdf_path, pg_num, img_path, class_name=fund_class)
 
                 fund_results.append({
